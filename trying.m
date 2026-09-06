@@ -107,7 +107,7 @@ compare_cooling_variants_4cases(p);
 t = res_design.t; T_core=res_design.T_core; T_shell=res_design.T_shell;
 T_pcm1=res_design.T_pcm1; T_pcm2=res_design.T_pcm2; N=length(t);
 
-Q_ohm_v=zeros(N,1); Q_ent_v=zeros(N,1); Q_gen_v=zeros(N,1);
+Q_ohm_v=zeros(N,1); Q_RC_v=zeros(N,1); Q_ent_v=zeros(N,1); Q_gen_v=zeros(N,1);
 I_v=zeros(N,1); SOC_v=zeros(N,1); h_v=zeros(N,1);
 Q_conv_v=zeros(N,1); Q_rad_v=zeros(N,1); P_drag_v=zeros(N,1);
 f1_v=zeros(N,1); f2_v=zeros(N,1);
@@ -116,25 +116,38 @@ for i=1:N
     [Ii,SOCi]=mission_current_soc(t(i),p);
     [Rpack,dUdT]=battery_maps(T_core(i),SOCi,p);
     Q_ohm_v(i)=Ii^2*Rpack;
+    Q_RC_v(i)=res_design.V_RC(i)*Ii;
     Q_ent_v(i)=Ii*(T_core(i)+273.15)*dUdT;
-    Q_gen_v(i)=Q_ohm_v(i)+Q_ent_v(i);
+    Q_gen_v(i)=Q_ohm_v(i)+Q_RC_v(i)+Q_ent_v(i);
 
     h_v(i)=h_external(T_pcm2(i),p.T_amb,p.V_cruise,p.H_flight,p);
     Q_conv_v(i)=h_v(i)*p.A_rad*(T_pcm2(i)-p.T_amb);
     Q_rad_v(i)=p.epsilon*p.sigma_SB*p.A_rad*((T_pcm2(i)+273.15)^4-(p.T_amb+273.15)^4);
 
     [~,P_drag_v(i)] = radiator_drag(T_pcm2(i), p.T_amb, p.V_cruise, p.H_flight, p);
-    f1_v(i)=f_liquid(T_pcm1(i),p); f2_v(i)=f_liquid(T_pcm2(i),p);
+    dT1_sign_post = branch_sign_from_samples(T_pcm1, i);
+    dT2_sign_post = branch_sign_from_samples(T_pcm2, i);
+    f1_v(i)=f_liquid(T_pcm1(i),p,dT1_sign_post);
+    f2_v(i)=f_liquid(T_pcm2(i),p,dT2_sign_post);
     I_v(i)=Ii; SOC_v(i)=SOCi;
 end
 
-E_gen=trapz(t,Q_gen_v); E_ohm=trapz(t,Q_ohm_v); E_ent=trapz(t,Q_ent_v);
+E_gen=trapz(t,Q_gen_v); E_ohm=trapz(t,Q_ohm_v); E_RC=trapz(t,Q_RC_v); E_ent=trapz(t,Q_ent_v);
 E_conv=trapz(t,Q_conv_v); E_rad=trapz(t,Q_rad_v); E_drag=trapz(t,P_drag_v);
 
 m1=m_pcm_design*p.pcm_split; m2=m_pcm_design*(1-p.pcm_split);
-E_lat = m1*p.L_pcm*max(f1_v) + m2*p.L_pcm*max(f2_v);
-E_sensible = p.C_core*(T_core(end)-p.T0)+p.C_shell*(T_shell(end)-p.T0);
-E_out_total = E_conv+E_rad+E_lat+E_sensible;
+f1_end_sign = branch_sign_from_samples(T_pcm1, N);
+f2_end_sign = branch_sign_from_samples(T_pcm2, N);
+f1_init = f_liquid(T_pcm1(1), p, branch_sign_from_samples(T_pcm1, 1));
+f2_init = f_liquid(T_pcm2(1), p, branch_sign_from_samples(T_pcm2, 1));
+f1_end  = f_liquid(T_pcm1(end), p, f1_end_sign);
+f2_end  = f_liquid(T_pcm2(end), p, f2_end_sign);
+E_lat = m1*p.L_pcm*(f1_end-f1_init) + m2*p.L_pcm*(f2_end-f2_init);
+E_pcm1 = pcm_stored_energy(T_pcm1(end), T_pcm1(1), m1, p, f1_end_sign);
+E_pcm2 = pcm_stored_energy(T_pcm2(end), T_pcm2(1), m2, p, f2_end_sign);
+E_pcm_sensible = E_pcm1 + E_pcm2 - E_lat;
+E_stored_total = p.C_core*(T_core(end)-p.T0) + p.C_shell*(T_shell(end)-p.T0) + E_pcm1 + E_pcm2;
+E_out_total = E_conv+E_rad+E_stored_total;
 E_balance = abs(E_gen-E_out_total)/max(E_gen,1)*100;
 
 [T_core_max,idx_cm]=max(T_core); t_core_max=t(idx_cm);
@@ -184,9 +197,10 @@ fprintf('║  %-70s║\n',sprintf('Tshell max= %.2f°C @ %.1fs',T_shell_max,t_sh
 fprintf('║  %-70s║\n',sprintf('T>40: %.1fs | T>45: %.1fs | T>60: %.1fs',t_above_opt,t_above_warn,t_above_crit));
 fprintf('%s\n',SEP);
 fprintf('║%s║\n',section_title('3. ЭНЕРГОБАЛАНС',W)); fprintf('%s\n',SEP);
-fprintf('║  %-70s║\n',sprintf('Egen=%.1fJ (Ohm=%.1fJ, Ent=%.1fJ)',E_gen,E_ohm,E_ent));
-fprintf('║  %-70s║\n',sprintf('Econv=%.1fJ, Erad=%.1fJ, Elat=%.1fJ, Edrag=%.1fJ',E_conv,E_rad,E_lat,E_drag));
-fprintf('║  %-70s║\n',sprintf('Residual=%.4f%%',E_balance));
+fprintf('║  %-70s║\n',sprintf('Egen=%.1fJ (Ohm=%.1fJ, RC=%.1fJ, Ent=%.1fJ)',E_gen,E_ohm,E_RC,E_ent));
+fprintf('║  %-70s║\n',sprintf('Econv=%.1fJ, Erad=%.1fJ, Estored=%.1fJ (PCM=%.1fJ, Lat=%.1fJ)', ...
+    E_conv,E_rad,E_stored_total,E_pcm1+E_pcm2,E_lat));
+fprintf('║  %-70s║\n',sprintf('PCM sensible=%.1fJ, Edrag=%.1fJ, Residual=%.4f%%',E_pcm_sensible,E_drag,E_balance));
 fprintf('%s\n',SEP);
 fprintf('║%s║\n',section_title('4. ОПТИМУМ PCM',W)); fprintf('%s\n',SEP);
 if opt_found
@@ -204,10 +218,10 @@ fprintf('%s\n',BOT);
 
 %% 7) CSV
 fid=fopen('thermal_report_catapult.csv','w');
-fprintf(fid,'t_s,T_core_C,T_shell_C,T_pcm1_C,T_pcm2_C,I_A,SOC,Q_ohm_W,Q_ent_W,Q_gen_W,h_W_m2K,Q_conv_W,Q_rad_W,f1,f2,Pdrag_W\n');
+fprintf(fid,'t_s,T_core_C,T_shell_C,T_pcm1_C,T_pcm2_C,I_A,SOC,Q_ohm_W,Q_RC_W,Q_ent_W,Q_gen_W,h_W_m2K,Q_conv_W,Q_rad_W,f1,f2,Pdrag_W\n');
 for i=1:N
-    fprintf(fid,'%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n',...
-        t(i),T_core(i),T_shell(i),T_pcm1(i),T_pcm2(i),I_v(i),SOC_v(i),Q_ohm_v(i),Q_ent_v(i),Q_gen_v(i),...
+    fprintf(fid,'%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n',...
+        t(i),T_core(i),T_shell(i),T_pcm1(i),T_pcm2(i),I_v(i),SOC_v(i),Q_ohm_v(i),Q_RC_v(i),Q_ent_v(i),Q_gen_v(i),...
         h_v(i),Q_conv_v(i),Q_rad_v(i),f1_v(i),f2_v(i),P_drag_v(i));
 end
 fclose(fid);
@@ -346,27 +360,29 @@ Qcs = (Tc - Ts) / p.R_core_shell;
 Qsp = (Ts - T1) / p.R_shell_pcm1;
 
 % PATCH 5: динамическое R_pcm12 (жидкий PCM хуже проводит)
-f1_now      = f_liquid(T1, p, 1);          % для R_pcm12 используем текущее f
+dT1_sign = branch_sign_local(Qsp - (T1 - T2) / p.R_pcm12);
+f1_now      = f_liquid(T1, p, dT1_sign);   % используем ту же ветвь гистерезиса
 k_pcm       = 0.20*(1-f1_now) + 0.10*f1_now;  % 0.20 тв / 0.10 жидк. Вт/(м·К)
 L_pcm_layer = 0.01;                        % м, толщина слоя
 A_pcm_cs    = 0.02;                        % м², поперечное сечение
 R_pcm12_dyn = L_pcm_layer / (k_pcm * A_pcm_cs);
 Q12 = (T1 - T2) / R_pcm12_dyn;
 
-% PATCH 6: знак dT для гистерезиса PCM
-dT1_sign = Qsp - Q12;   % >0 нагрев, <0 охлаждение
+% PATCH 6: знак dT для гистерезиса PCM берём из локального теплобаланса
+dT1_sign = branch_sign_local(Qsp - Q12);
 
 % ---- внешний теплообмен ----
 h     = h_external(T2, p.T_amb, p.V_cruise, p.H_flight, p);
 Qconv = h * p.A_rad * (T2 - p.T_amb);
 Qrad  = p.epsilon * p.sigma_SB * p.A_rad * ...
         ((T2+273.15)^4 - (p.T_amb+273.15)^4);
+dT2_sign = branch_sign_local(Q12 - Qconv - Qrad);
 
 % ---- теплоёмкости PCM с гистерезисом ----
 m1 = m_pcm * p.pcm_split;
 m2 = m_pcm * (1 - p.pcm_split);
 C1 = Ceff_pcm(T1, m1, p, dT1_sign);
-C2 = Ceff_pcm(T2, m2, p, 1);   % T_pcm2 обычно следует за T_pcm1
+C2 = Ceff_pcm(T2, m2, p, dT2_sign);
 
 dydt = [(Qgen - Qcs)          / p.C_core;
         (Qcs  - Qsp)          / p.C_shell;
@@ -526,34 +542,84 @@ Pdrag = Fdrag*V;
 end
 
 % -----------------------------------------------------------------------
-% PATCH 5+6: Ceff_pcm с гистерезисом (опциональный аргумент dTdt)
+% PATCH 5+6: Ceff_pcm использует ту же f(T), что и пост-обработка,
+% поэтому скрытая теплота всегда интегрируется ровно в m*L_pcm.
 function C = Ceff_pcm(T, m, p, dTdt)
 if nargin < 4, dTdt = 1; end
-dTm = max(p.dT_melt, 1e-6);
-a   = max(0, min(1, (T-p.T_sol)/dTm));
+dTdt = branch_sign_local(dTdt);
+a   = f_liquid(T, p, dTdt);
 c   = p.c_solid + (p.c_liquid - p.c_solid)*a;
-% гистерезис: при охлаждении сдвигаем пики на -2°C
-if dTdt >= 0
-    T_peak1 = p.T_sol; T_peak2 = p.T_liq;
-else
-    T_peak1 = p.T_sol - 2.0; T_peak2 = p.T_liq - 2.0;
-end
-d = (1/(2*p.eps_tanh)) * (sech((T-T_peak1)/p.eps_tanh)^2*0.5 + ...
-                            sech((T-T_peak2)/p.eps_tanh)^2*0.5);
+d = df_liquid_dT(T, p, dTdt);
 C = max(20, m*(c + p.L_pcm*d));
 end
 
 % -----------------------------------------------------------------------
-% PATCH 6: f_liquid с гистерезисом
+% PATCH 6: f_liquid/df_dT/Ceff используют одни и те же границы перехода.
 function f = f_liquid(T, p, dTdt)
 if nargin < 3, dTdt = 1; end
-dTm = max(p.dT_melt, 1e-6);
-if dTdt >= 0
-    f = max(0, min(1, (T - p.T_sol) / dTm));
-else
-    T_sc = p.T_sol - 2.0;   % суперкулинг при кристаллизации
-    f    = max(0, min(1, (T - T_sc) / dTm));
+[Tsol, Tliq] = pcm_transition_bounds(p, dTdt);
+dTm = max(Tliq - Tsol, 1e-6);
+f = max(0, min(1, (T - Tsol) / dTm));
 end
+
+function df = df_liquid_dT(T, p, dTdt)
+[Tsol, Tliq] = pcm_transition_bounds(p, dTdt);
+dTm = max(Tliq - Tsol, 1e-6);
+df = zeros(size(T));
+mask = (T >= Tsol) & (T <= Tliq);
+df(mask) = 1 / dTm;
+end
+
+function [Tsol, Tliq] = pcm_transition_bounds(p, dTdt)
+if branch_sign_local(dTdt) >= 0
+    Tsol = p.T_sol;
+    Tliq = p.T_liq;
+else
+    % При кристаллизации сохраняем ту же ширину перехода, но сдвигаем
+    % границы вниз, чтобы учесть переохлаждение согласованно во всех функциях.
+    Tsol = p.T_sol - 2.0;
+    Tliq = p.T_liq - 2.0;
+end
+end
+
+function s = branch_sign_local(x)
+if x >= 0
+    s = 1;
+else
+    s = -1;
+end
+end
+
+function s = branch_sign_from_samples(Tv, i)
+N = length(Tv);
+if N <= 1
+    s = 1;
+elseif i <= 1
+    s = branch_sign_local(Tv(2) - Tv(1));
+else
+    s = branch_sign_local(Tv(i) - Tv(i-1));
+end
+end
+
+function h = pcm_sensible_enthalpy(T, p, dTdt)
+[Tsol, Tliq] = pcm_transition_bounds(p, dTdt);
+dTm = max(Tliq - Tsol, 1e-6);
+dc = p.c_liquid - p.c_solid;
+if T <= Tsol
+    h = p.c_solid * T;
+elseif T >= Tliq
+    h_mid = p.c_solid * Tliq + dc * dTm / 2;
+    h = h_mid + p.c_liquid * (T - Tliq);
+else
+    h = p.c_solid * T + dc * (T - Tsol)^2 / (2 * dTm);
+end
+end
+
+function E = pcm_stored_energy(T, Tref, m, p, dTdt)
+f_now = f_liquid(T, p, dTdt);
+f_ref = f_liquid(Tref, p, dTdt);
+E = m * (pcm_sensible_enthalpy(T, p, dTdt) - pcm_sensible_enthalpy(Tref, p, dTdt) + ...
+         p.L_pcm * (f_now - f_ref));
 end
 
 % -----------------------------------------------------------------------
@@ -669,7 +735,7 @@ print_delta_local('C', kA, kC);
 print_delta_local('D', kA, kD);
 
 fid = fopen('compare_cooling_variants_4cases.csv','w');
-fprintf(fid,'variant,Tcore_max_C,Tshell_max_C,t_above_45_core_s,t_above_40_shell_s,Egen_J,Econv_J,Erad_J,Elat_J,Edrag_J,residual_pct,pass\n');
+fprintf(fid,'variant,Tcore_max_C,Tshell_max_C,t_above_45_core_s,t_above_40_shell_s,Egen_J,Econv_J,Erad_J,Elat_J,Estored_J,Edrag_J,residual_pct,pass\n');
 write_row_local(fid, 'A_NoPCM_NoRad', kA);
 write_row_local(fid, 'B_PCM_only',    kB);
 write_row_local(fid, 'C_Rad_only',    kC);
@@ -686,6 +752,7 @@ Tc = r.T_core;
 Ts = r.T_shell;
 T1 = r.T_pcm1;
 T2 = r.T_pcm2;
+Vrc = r.V_RC;
 N  = length(t);
 
 Qgen=zeros(N,1); Qconv=zeros(N,1); Qrad=zeros(N,1);
@@ -694,13 +761,13 @@ Pdrag=zeros(N,1); f1=zeros(N,1); f2=zeros(N,1);
 for i = 1:N
     [I, SOC]      = mission_current_soc(t(i), p);
     [Rpack, dUdT] = battery_maps(Tc(i), SOC, p);
-    Qgen(i)  = I^2*Rpack + I*(Tc(i)+273.15)*dUdT;
+    Qgen(i)  = I^2*Rpack + Vrc(i)*I + I*(Tc(i)+273.15)*dUdT;
     h        = h_external(T2(i), p.T_amb, p.V_cruise, p.H_flight, p);
     Qconv(i) = h*p.A_rad*(T2(i)-p.T_amb);
     Qrad(i)  = p.epsilon*p.sigma_SB*p.A_rad*((T2(i)+273.15)^4-(p.T_amb+273.15)^4);
     [~,Pdrag(i)] = radiator_drag(T2(i), p.T_amb, p.V_cruise, p.H_flight, p);
-    f1(i) = f_liquid(T1(i), p);
-    f2(i) = f_liquid(T2(i), p);
+    f1(i) = f_liquid(T1(i), p, branch_sign_from_samples(T1, i));
+    f2(i) = f_liquid(T2(i), p, branch_sign_from_samples(T2, i));
 end
 
 Egen  = trapz(t, Qgen);
@@ -710,9 +777,13 @@ Edrag = trapz(t, Pdrag);
 
 m1   = m_pcm * p.pcm_split;
 m2   = m_pcm * (1-p.pcm_split);
-Elat = m1*p.L_pcm*max(f1) + m2*p.L_pcm*max(f2);
-Esens = p.C_core*(Tc(end)-p.T0) + p.C_shell*(Ts(end)-p.T0);
-resid = abs(Egen-(Econv+Erad+Elat+Esens)) / max(Egen,1) * 100;
+dT1_sign_end = branch_sign_from_samples(T1, N);
+dT2_sign_end = branch_sign_from_samples(T2, N);
+Elat = m1*p.L_pcm*(f1(end)-f1(1)) + m2*p.L_pcm*(f2(end)-f2(1));
+Epcm1 = pcm_stored_energy(T1(end), T1(1), m1, p, dT1_sign_end);
+Epcm2 = pcm_stored_energy(T2(end), T2(1), m2, p, dT2_sign_end);
+Estored = p.C_core*(Tc(end)-p.T0) + p.C_shell*(Ts(end)-p.T0) + Epcm1 + Epcm2;
+resid = abs(Egen-(Econv+Erad+Estored)) / max(Egen,1) * 100;
 
 dt = mean(diff(t));
 k = struct();
@@ -722,7 +793,7 @@ k.t_above_45_core  = sum(Tc>45)*dt;
 k.t_above_40_shell = sum(Ts>40)*dt;
 k.Egen  = Egen;  k.Econv = Econv;
 k.Erad  = Erad;  k.Elat  = Elat;
-k.Edrag = Edrag; k.resid = resid;
+k.Estored = Estored; k.Edrag = Edrag; k.resid = resid;
 end
 
 function print_variant_line_local(name, k)
@@ -741,9 +812,9 @@ end
 
 function write_row_local(fid, name, k)
 pf = (k.Tcore_max<=45) && (k.Tshell_max<=40);
-fprintf(fid,'%s,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.5f,%s\n', ...
+fprintf(fid,'%s,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.5f,%s\n', ...
     name, k.Tcore_max, k.Tshell_max, k.t_above_45_core, k.t_above_40_shell, ...
-    k.Egen, k.Econv, k.Erad, k.Elat, k.Edrag, k.resid, ternary_local(pf,'PASS','FAIL'));
+    k.Egen, k.Econv, k.Erad, k.Elat, k.Estored, k.Edrag, k.resid, ternary_local(pf,'PASS','FAIL'));
 end
 
 function out = ternary_local(cond, a, b)
